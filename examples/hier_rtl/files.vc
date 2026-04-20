@@ -1,0 +1,6 @@
+// Example filelist for verilog_propagator
+leaf.v
+sub.v
+mid.v
+top.v
++top+top

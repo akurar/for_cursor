@@ -1,0 +1,14 @@
+[project]
+name = "verilog-propagator"
+version = "0.1.0"
+description = "Verilog hierarchical port change auto-propagator"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
