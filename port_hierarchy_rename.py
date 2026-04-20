@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-port_hierarchy_rename.py — Chip Design Port Hierarchy Rename Tool
+port_hierarchy_rename.py -- Chip Design Port Hierarchy Rename Tool
 
 Renames a port in a Verilog module and automatically propagates the change
 upward through all hierarchy levels, as defined by a VC (filelist) file.
 
 The tool parses the VC file to discover all Verilog sources, builds the design
 hierarchy from instantiation relationships, then traces the target port upward
-through every parent module — renaming connected signals, wire/reg declarations,
+through every parent module -- renaming connected signals, wire/reg declarations,
 port declarations, and instance port-connection names along the way.
+
+Requirements: Python 3.6+
 """
+
+from __future__ import print_function
 
 import re
 import os
@@ -17,6 +22,11 @@ import sys
 import shutil
 import argparse
 from collections import defaultdict, OrderedDict
+
+if sys.version_info < (3, 6):
+    print("ERROR: Python 3.6 or later is required (f-string support).")
+    print("Current version: Python {}.{}.{}".format(*sys.version_info[:3]))
+    sys.exit(1)
 
 
 VERILOG_KEYWORDS = frozenset({
@@ -57,14 +67,14 @@ def parse_vc_file(vc_path, _visited=None):
     _visited.add(vc_abs)
 
     if not os.path.isfile(vc_abs):
-        print(f"[ERROR] VC file not found: {vc_abs}", file=sys.stderr)
+        print("[ERROR] VC file not found: {}".format(vc_abs), file=sys.stderr)
         return []
 
     base_dir = os.path.dirname(vc_abs)
     files = []
 
-    with open(vc_abs, 'r', encoding='utf-8', errors='replace') as f:
-        for raw_line in f:
+    with open(vc_abs, 'r', encoding='utf-8', errors='replace') as fh:
+        for raw_line in fh:
             line = raw_line.split('//')[0].strip()
             if not line:
                 continue
@@ -91,7 +101,7 @@ def parse_vc_file(vc_path, _visited=None):
             if os.path.isfile(fpath):
                 files.append(os.path.abspath(fpath))
             else:
-                print(f"  [WARN] File not found, skipping: {fpath}")
+                print("  [WARN] File not found, skipping: {}".format(fpath))
 
     return files
 
@@ -101,6 +111,7 @@ def parse_vc_file(vc_path, _visited=None):
 # ============================================================
 
 class Port:
+    """Represents a module port with name, direction, and optional width."""
     __slots__ = ('name', 'direction', 'width')
 
     def __init__(self, name, direction, width=''):
@@ -109,41 +120,50 @@ class Port:
         self.width = width
 
     def __repr__(self):
-        w = f" {self.width}" if self.width else ""
-        return f"{self.direction}{w} {self.name}"
+        w = " " + self.width if self.width else ""
+        return "{}{}  {}".format(self.direction, w, self.name)
 
 
 class Module:
+    """Represents a parsed Verilog module."""
+
     def __init__(self, name, filepath):
         self.name = name
         self.filepath = filepath
-        self.ports = OrderedDict()
-        self.wires = OrderedDict()
-        self.instances = []
+        self.ports = OrderedDict()      # name -> Port
+        self.wires = OrderedDict()      # name -> {'kind': str, 'width': str}
+        self.instances = []             # list of dicts
 
     def __repr__(self):
-        return f"Module({self.name}, ports={list(self.ports.keys())})"
+        return "Module({}, ports={})".format(self.name, list(self.ports.keys()))
 
 
 def strip_comments(text):
-    """Remove Verilog comments, preserving newline counts for position stability."""
-    text = re.sub(r'/\*.*?\*/', lambda m: '\n' * m.group().count('\n'), text, flags=re.DOTALL)
+    """Remove Verilog block and line comments."""
+    text = re.sub(
+        r'/\*.*?\*/',
+        lambda m: '\n' * m.group().count('\n'),
+        text,
+        flags=re.DOTALL,
+    )
     text = re.sub(r'//[^\n]*', '', text)
     return text
 
 
 def _skip_ws(text, pos):
-    """Advance *pos* past whitespace characters."""
-    while pos < len(text) and text[pos] in ' \t\n\r':
+    """Advance past whitespace characters starting at *pos*."""
+    n = len(text)
+    while pos < n and text[pos] in ' \t\n\r':
         pos += 1
     return pos
 
 
 def _match_paren(text, pos):
-    """From *pos* (must point at ``(``) find the matching ``)``. Returns index after ``)``."""
+    """From *pos* (pointing at '(') find the matching ')'. Returns index after ')'."""
     depth = 0
     i = pos
-    while i < len(text):
+    n = len(text)
+    while i < n:
         ch = text[i]
         if ch == '(':
             depth += 1
@@ -152,45 +172,58 @@ def _match_paren(text, pos):
             if depth == 0:
                 return i + 1
         i += 1
-    return len(text)
+    return n
+
+
+# Regex that matches a Verilog identifier (letter or underscore, then word chars).
+_IDENT_RE = re.compile(r'[A-Za-z_]\w*')
 
 
 def _parse_instances(body):
-    """Extract module instantiations from a (comment-stripped) module body."""
+    """Extract module instantiations from a (comment-stripped) module body.
+
+    Scans for patterns like:
+        module_type  [#(...)]  inst_name  ( .port(signal), ... );
+    Uses _IDENT_RE to only match proper identifiers (not bare numbers).
+    """
     instances = []
-    i = 0
-    while i < len(body):
-        m = re.search(r'\b(\w+)\b', body[i:])
-        if not m:
+    pos = 0
+    body_len = len(body)
+
+    while pos < body_len:
+        m = _IDENT_RE.search(body, pos)
+        if m is None:
             break
-        word = m.group(1)
-        pos = i + m.end()
+
+        word = m.group()
+        after_word = m.end()
+
         if word in VERILOG_KEYWORDS:
-            i = pos
+            pos = after_word
             continue
 
-        pos = _skip_ws(body, pos)
+        cur = _skip_ws(body, after_word)
 
-        if pos < len(body) and body[pos] == '#':
-            pos = _skip_ws(body, pos + 1)
-            if pos < len(body) and body[pos] == '(':
-                pos = _match_paren(body, pos)
-                pos = _skip_ws(body, pos)
+        if cur < body_len and body[cur] == '#':
+            cur = _skip_ws(body, cur + 1)
+            if cur < body_len and body[cur] == '(':
+                cur = _match_paren(body, cur)
+                cur = _skip_ws(body, cur)
 
-        nm = re.match(r'(\w+)', body[pos:])
-        if not nm or nm.group(1) in VERILOG_KEYWORDS:
-            i = pos if pos > i else i + m.end()
-            continue
-        iname = nm.group(1)
-        pos = _skip_ws(body, pos + nm.end())
-
-        if pos >= len(body) or body[pos] != '(':
-            i = pos if pos > i else i + m.end()
+        nm = _IDENT_RE.match(body, cur)
+        if nm is None or nm.group() in VERILOG_KEYWORDS:
+            pos = max(after_word, cur + 1) if cur < body_len else after_word
             continue
 
-        conn_start = pos + 1
-        paren_end = _match_paren(body, pos)
-        conn_text = body[conn_start:paren_end - 1]
+        inst_name_end = nm.end()
+        cur = _skip_ws(body, inst_name_end)
+
+        if cur >= body_len or body[cur] != '(':
+            pos = max(after_word, cur)
+            continue
+
+        paren_end = _match_paren(body, cur)
+        conn_text = body[cur + 1:paren_end - 1]
 
         connections = {}
         for cm in re.finditer(r'\.(\w+)\s*\(\s*([^)]*?)\s*\)', conn_text):
@@ -199,56 +232,57 @@ def _parse_instances(body):
         if connections:
             instances.append({
                 'type': word,
-                'name': iname,
+                'name': nm.group(),
                 'connections': connections,
             })
 
-        i = paren_end
+        pos = paren_end
+
     return instances
 
 
 def parse_verilog_modules(file_list):
-    """Parse every file in *file_list* and return ``{module_name: Module}``."""
+    """Parse every file in *file_list* and return {module_name: Module}."""
     modules = OrderedDict()
 
     for filepath in file_list:
         try:
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                raw = f.read()
-        except IOError as e:
-            print(f"  [WARN] Cannot read {filepath}: {e}")
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
+                raw = fh.read()
+        except IOError as exc:
+            print("  [WARN] Cannot read {}: {}".format(filepath, exc))
             continue
 
         clean = strip_comments(raw)
 
         for m in re.finditer(r'\bmodule\s+(\w+)', clean):
             mod_name = m.group(1)
-            pos = m.end()
+            cur = m.end()
 
-            pos = _skip_ws(clean, pos)
-            if pos < len(clean) and clean[pos] == '#':
-                pos = _skip_ws(clean, pos + 1)
-                if pos < len(clean) and clean[pos] == '(':
-                    pos = _match_paren(clean, pos)
+            cur = _skip_ws(clean, cur)
+            if cur < len(clean) and clean[cur] == '#':
+                cur = _skip_ws(clean, cur + 1)
+                if cur < len(clean) and clean[cur] == '(':
+                    cur = _match_paren(clean, cur)
 
-            pos = _skip_ws(clean, pos)
-            if pos >= len(clean) or clean[pos] != '(':
+            cur = _skip_ws(clean, cur)
+            if cur >= len(clean) or clean[cur] != '(':
                 continue
-            port_end = _match_paren(clean, pos)
-            port_text = clean[pos + 1:port_end - 1]
+            port_end = _match_paren(clean, cur)
+            port_text = clean[cur + 1:port_end - 1]
 
             semi_pos = clean.find(';', port_end)
             if semi_pos == -1:
                 continue
 
             em = re.search(r'\bendmodule\b', clean[semi_pos:])
-            if not em:
+            if em is None:
                 continue
             body = clean[semi_pos + 1:semi_pos + em.start()]
 
             mod = Module(mod_name, filepath)
 
-            # --- ports ---
+            # --- ports (ANSI style) ---
             ansi_pat = re.compile(
                 r'(input|output|inout)\s+'
                 r'(?:wire|reg|logic)?\s*'
@@ -262,6 +296,7 @@ def parse_verilog_modules(file_list):
                 for direction, width, name in ansi_ports:
                     mod.ports[name] = Port(name, direction, width.strip() if width else '')
             else:
+                # --- ports (non-ANSI / Verilog-1995 style) ---
                 port_names = set(re.findall(r'\w+', port_text))
                 decl_pat = re.compile(
                     r'(input|output|inout)\s+'
@@ -273,11 +308,11 @@ def parse_verilog_modules(file_list):
                 for dm in decl_pat.finditer(body):
                     direction = dm.group(1)
                     width = dm.group(2).strip() if dm.group(2) else ''
-                    for n in re.findall(r'\w+', dm.group(3)):
-                        if n in port_names:
-                            mod.ports[n] = Port(n, direction, width)
+                    for name in re.findall(r'\w+', dm.group(3)):
+                        if name in port_names:
+                            mod.ports[name] = Port(name, direction, width)
 
-            # --- wire / reg ---
+            # --- wire / reg declarations ---
             wire_pat = re.compile(
                 r'\b(wire|reg|logic)\s+'
                 r'(?:signed\s+)?'
@@ -287,9 +322,9 @@ def parse_verilog_modules(file_list):
             for wm in wire_pat.finditer(body):
                 kind = wm.group(1)
                 width = wm.group(2).strip() if wm.group(2) else ''
-                for n in re.findall(r'\w+', wm.group(3)):
-                    if n not in mod.ports and n not in VERILOG_KEYWORDS:
-                        mod.wires[n] = {'kind': kind, 'width': width}
+                for name in re.findall(r'\w+', wm.group(3)):
+                    if name not in mod.ports and name not in VERILOG_KEYWORDS:
+                        mod.wires[name] = {'kind': kind, 'width': width}
 
             # --- instances ---
             mod.instances = _parse_instances(body)
@@ -304,7 +339,7 @@ def parse_verilog_modules(file_list):
 # ============================================================
 
 def build_parent_map(modules):
-    """Return ``{child_module_name: [(parent_module_name, instance_dict), ...]}``."""
+    """Return {child_module_name: [(parent_module_name, instance_dict), ...]}."""
     parents = defaultdict(list)
     for mod_name, mod in modules.items():
         for inst in mod.instances:
@@ -323,11 +358,14 @@ def print_hierarchy(modules, parent_map):
     tops = [m for m in modules if m not in parent_map]
 
     def _tree(mod, prefix='', is_last=True):
-        connector = '└── ' if is_last else '├── '
-        print(f"{prefix}{connector}{mod}" if prefix else f"  {mod}")
-        ext = prefix + ('    ' if is_last else '│   ')
+        connector = '+-- ' if is_last else '|-- '
+        if prefix:
+            print("{}{}{}".format(prefix, connector, mod))
+        else:
+            print("  {}".format(mod))
+        ext = prefix + ('    ' if is_last else '|   ')
         kids = children_of.get(mod, [])
-        for idx, (iname, child) in enumerate(kids):
+        for idx, (_iname, child) in enumerate(kids):
             _tree(child, ext, idx == len(kids) - 1)
 
     for t in tops:
@@ -342,9 +380,7 @@ def compute_rename_plan(modules, parent_map, start_module, old_port, new_name):
     """
     BFS upward from *start_module* / *old_port* and collect every rename action.
 
-    Returns a list of action dicts (one per affected module, in bottom-up order):
-    ``[{ 'module', 'file', 'signal_renames': [(old,new),...],
-         'inst_port_renames': [(child_type, old_port, new_port),...] }, ...]``
+    Returns a list of action dicts (one per affected module, in bottom-up order).
     """
     plan = OrderedDict()
 
@@ -360,9 +396,10 @@ def compute_rename_plan(modules, parent_map, start_module, old_port, new_name):
 
     while queue:
         child_mod, child_port = queue.pop(0)
-        if (child_mod, child_port) in visited:
+        key = (child_mod, child_port)
+        if key in visited:
             continue
-        visited.add((child_mod, child_port))
+        visited.add(key)
 
         if child_mod not in parent_map:
             continue
@@ -386,9 +423,10 @@ def compute_rename_plan(modules, parent_map, start_module, old_port, new_name):
             action['inst_port_renames'].append((child_mod, child_port, new_name))
 
             if not re.match(r'^\w+$', connected_signal):
-                print(f"  [INFO] In module '{parent_name}', port .{child_port} connects to "
-                      f"expression '{connected_signal}' — only the port-connection name will "
-                      f"be renamed; the expression is left unchanged.")
+                print("  [INFO] In module '{}', port .{} connects to "
+                      "expression '{}' -- only the port-connection name will "
+                      "be renamed; the expression is left unchanged.".format(
+                          parent_name, child_port, connected_signal))
                 continue
 
             if connected_signal != new_name:
@@ -408,14 +446,14 @@ def compute_rename_plan(modules, parent_map, start_module, old_port, new_name):
 # ============================================================
 
 def _find_module_span(content, module_name):
-    """Return ``(start, end)`` character offsets of a ``module … endmodule`` block."""
+    """Return (start, end) character offsets of a 'module ... endmodule' block."""
     pat = re.compile(r'\bmodule\s+' + re.escape(module_name) + r'\b')
     m = pat.search(content)
-    if not m:
+    if m is None:
         return None, None
     start = m.start()
     em = re.search(r'\bendmodule\b', content[m.end():])
-    if not em:
+    if em is None:
         return start, len(content)
     return start, m.end() + em.end()
 
@@ -423,7 +461,7 @@ def _find_module_span(content, module_name):
 def _rename_inst_port(module_text, child_type, old_port, new_port):
     """
     Within *module_text*, find instantiations of *child_type* and rename
-    ``.old_port(`` → ``.new_port(`` inside those instantiation blocks only.
+    .old_port( -> .new_port( inside those instantiation blocks only.
     """
     parts = []
     search_start = 0
@@ -431,32 +469,32 @@ def _rename_inst_port(module_text, child_type, old_port, new_port):
 
     while search_start < len(module_text):
         hm = header_re.search(module_text, search_start)
-        if not hm:
+        if hm is None:
             parts.append(module_text[search_start:])
             break
 
-        pos = hm.end()
-        pos = _skip_ws(module_text, pos)
+        cur = hm.end()
+        cur = _skip_ws(module_text, cur)
 
-        if pos < len(module_text) and module_text[pos] == '#':
-            pos = _skip_ws(module_text, pos + 1)
-            if pos < len(module_text) and module_text[pos] == '(':
-                pos = _match_paren(module_text, pos)
-                pos = _skip_ws(module_text, pos)
+        if cur < len(module_text) and module_text[cur] == '#':
+            cur = _skip_ws(module_text, cur + 1)
+            if cur < len(module_text) and module_text[cur] == '(':
+                cur = _match_paren(module_text, cur)
+                cur = _skip_ws(module_text, cur)
 
-        nm = re.match(r'\w+', module_text[pos:])
-        if not nm or nm.group() in VERILOG_KEYWORDS:
+        nm = _IDENT_RE.match(module_text, cur)
+        if nm is None or nm.group() in VERILOG_KEYWORDS:
             parts.append(module_text[search_start:hm.end()])
             search_start = hm.end()
             continue
-        pos = _skip_ws(module_text, pos + nm.end())
+        cur = _skip_ws(module_text, nm.end())
 
-        if pos >= len(module_text) or module_text[pos] != '(':
+        if cur >= len(module_text) or module_text[cur] != '(':
             parts.append(module_text[search_start:hm.end()])
             search_start = hm.end()
             continue
 
-        paren_end = _match_paren(module_text, pos)
+        paren_end = _match_paren(module_text, cur)
         semi = module_text.find(';', paren_end - 1)
         inst_end = semi + 1 if semi != -1 else paren_end
 
@@ -475,7 +513,7 @@ def _rename_inst_port(module_text, child_type, old_port, new_port):
 
 
 def _rename_signal(module_text, old_sig, new_sig):
-    """Replace *old_sig* as a standalone identifier (not preceded by ``.'') in *module_text*."""
+    """Replace *old_sig* as a standalone identifier (not preceded by '.') in *module_text*."""
     pattern = r'(?<!\.)(?<!\w)' + re.escape(old_sig) + r'(?!\w)'
     return re.sub(pattern, new_sig, module_text)
 
@@ -484,7 +522,7 @@ def apply_plan_to_files(plan, dry_run=False, backup=True):
     """
     Apply the full rename plan to the source files.
 
-    Returns ``{filepath: new_content}`` for every file that was changed.
+    Returns {filepath: new_content} for every file that was changed.
     """
     by_file = defaultdict(list)
     for action in plan:
@@ -493,21 +531,22 @@ def apply_plan_to_files(plan, dry_run=False, backup=True):
     results = {}
 
     for filepath, actions in by_file.items():
-        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-            content = f.read()
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
+            content = fh.read()
 
         original = content
 
         for action in actions:
             start, end = _find_module_span(content, action['module'])
             if start is None:
-                print(f"  [WARN] Module '{action['module']}' not found in {filepath}")
+                print("  [WARN] Module '{}' not found in {}".format(
+                    action['module'], filepath))
                 continue
 
             mod_text = content[start:end]
 
-            for child_type, op, np in action['inst_port_renames']:
-                mod_text = _rename_inst_port(mod_text, child_type, op, np)
+            for child_type, op, np_ in action['inst_port_renames']:
+                mod_text = _rename_inst_port(mod_text, child_type, op, np_)
 
             for old_s, new_s in action['signal_renames']:
                 mod_text = _rename_signal(mod_text, old_s, new_s)
@@ -519,8 +558,8 @@ def apply_plan_to_files(plan, dry_run=False, backup=True):
             if not dry_run:
                 if backup:
                     shutil.copy2(filepath, filepath + '.bak')
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(content)
+                with open(filepath, 'w', encoding='utf-8') as fh:
+                    fh.write(content)
 
     return results
 
@@ -530,31 +569,38 @@ def apply_plan_to_files(plan, dry_run=False, backup=True):
 # ============================================================
 
 def display_plan(plan, modules):
-    print("\n" + "=" * 64)
+    """Print the rename plan in human-readable format."""
+    print("")
+    print("=" * 64)
     print("  RENAME PLAN")
     print("=" * 64)
 
     for idx, action in enumerate(plan, 1):
         mod = modules[action['module']]
-        print(f"\n  [{idx}] Module: {action['module']}")
-        print(f"      File:   {os.path.relpath(action['file'])}")
+        print("")
+        print("  [{}] Module: {}".format(idx, action['module']))
+        print("      File:   {}".format(os.path.relpath(action['file'])))
 
         for old, new in action['signal_renames']:
             p = mod.ports.get(old)
             w = mod.wires.get(old)
             if p:
-                width_str = f" {p.width}" if p.width else ""
-                print(f"      Port rename:   {p.direction}{width_str} {old}  ->  {new}")
+                width_str = " " + p.width if p.width else ""
+                print("      Port rename:   {}{} {}  ->  {}".format(
+                    p.direction, width_str, old, new))
             if w:
-                width_str = f" {w['width']}" if w['width'] else ""
-                print(f"      Wire rename:   {w['kind']}{width_str} {old}  ->  {new}")
+                width_str = " " + w['width'] if w['width'] else ""
+                print("      Wire rename:   {}{} {}  ->  {}".format(
+                    w['kind'], width_str, old, new))
             if not p and not w:
-                print(f"      Signal rename: {old}  ->  {new}")
+                print("      Signal rename: {}  ->  {}".format(old, new))
 
         for child_type, old_port, new_port in action['inst_port_renames']:
-            print(f"      Inst port:     {child_type}  .{old_port}()  ->  .{new_port}()")
+            print("      Inst port:     {}  .{}()  ->  .{}()".format(
+                child_type, old_port, new_port))
 
-    print("\n" + "=" * 64)
+    print("")
+    print("=" * 64)
 
 
 def display_diff(filepath, original, modified):
@@ -562,17 +608,18 @@ def display_diff(filepath, original, modified):
     old_lines = original.splitlines(keepends=True)
     new_lines = modified.splitlines(keepends=True)
 
-    print(f"\n--- {os.path.relpath(filepath)}")
-    print(f"+++ {os.path.relpath(filepath)}  (modified)")
+    print("")
+    print("--- {}".format(os.path.relpath(filepath)))
+    print("+++ {}  (modified)".format(os.path.relpath(filepath)))
 
     max_n = max(len(old_lines), len(new_lines))
     for i in range(max_n):
         ol = old_lines[i].rstrip('\n') if i < len(old_lines) else ''
         nl = new_lines[i].rstrip('\n') if i < len(new_lines) else ''
         if ol != nl:
-            print(f"  @line {i + 1}:")
-            print(f"    - {ol}")
-            print(f"    + {nl}")
+            print("  @line {}:".format(i + 1))
+            print("    - {}".format(ol))
+            print("    + {}".format(nl))
 
 
 # ============================================================
@@ -580,7 +627,7 @@ def display_diff(filepath, original, modified):
 # ============================================================
 
 def _parse_port_spec(spec):
-    """``'data_in[7:0]'`` → ``('data_in', '[7:0]')``."""
+    """Parse 'data_in[7:0]' -> ('data_in', '[7:0]')."""
     m = re.match(r'(\w+)\s*(\[[\d: ]+\])?\s*$', spec.strip())
     if m:
         return m.group(1), (m.group(2) or '').strip()
@@ -589,16 +636,19 @@ def _parse_port_spec(spec):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Chip-design port hierarchy rename tool.\n'
-                    'Renames a port and propagates the change through all hierarchy levels.',
+        description=(
+            'Chip-design port hierarchy rename tool.\n'
+            'Renames a port and propagates the change through all hierarchy levels.'
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''\
-Examples
---------
-  %(prog)s -m leaf_cell -p data_in -n rx_data -vc project.vc
-  %(prog)s -m leaf_cell -p "data_in[7:0]" -n rx_data -vc project.vc --dry-run
-  %(prog)s -m leaf_cell -p data_in -n rx_data -vc project.vc --no-backup -y
-''')
+        epilog=(
+            'Examples\n'
+            '--------\n'
+            '  %(prog)s -m leaf_cell -p data_in -n rx_data -vc project.vc\n'
+            '  %(prog)s -m leaf_cell -p "data_in[7:0]" -n rx_data -vc project.vc --dry-run\n'
+            '  %(prog)s -m leaf_cell -p data_in -n rx_data -vc project.vc --no-backup -y\n'
+        ),
+    )
 
     ap.add_argument('-m', '--module',
                     help='Module name that owns the port to rename')
@@ -619,27 +669,28 @@ Examples
 
     args = ap.parse_args()
 
+    # --- VC file is always needed ---
     if not args.vc_file:
         args.vc_file = input('VC file path: ').strip()
 
     # ---- 1. VC file ----
-    print(f"\n[1/5] Parsing VC file: {args.vc_file}")
+    print("\n[1/5] Parsing VC file: {}".format(args.vc_file))
     verilog_files = parse_vc_file(args.vc_file)
     if not verilog_files:
         print("[ERROR] No Verilog files found.", file=sys.stderr)
         sys.exit(1)
-    print(f"  Found {len(verilog_files)} source file(s)")
+    print("  Found {} source file(s)".format(len(verilog_files)))
 
     # ---- 2. Parse Verilog ----
-    print(f"\n[2/5] Parsing Verilog modules ...")
+    print("\n[2/5] Parsing Verilog modules ...")
     modules = parse_verilog_modules(verilog_files)
     if not modules:
         print("[ERROR] No modules parsed.", file=sys.stderr)
         sys.exit(1)
-    print(f"  Found {len(modules)} module(s): {', '.join(modules.keys())}")
+    print("  Found {} module(s): {}".format(len(modules), ', '.join(modules.keys())))
 
     # ---- 3. Build hierarchy ----
-    print(f"\n[3/5] Building hierarchy ...")
+    print("\n[3/5] Building hierarchy ...")
     parent_map = build_parent_map(modules)
     print("\n  Design hierarchy:")
     print_hierarchy(modules, parent_map)
@@ -663,24 +714,25 @@ Examples
 
     # ---- validate ----
     if module_name not in modules:
-        print(f"\n[ERROR] Module '{module_name}' not found.  "
-              f"Available: {', '.join(modules.keys())}", file=sys.stderr)
+        print("\n[ERROR] Module '{}' not found.  Available: {}".format(
+            module_name, ', '.join(modules.keys())), file=sys.stderr)
         sys.exit(1)
 
     mod = modules[module_name]
     if port_name not in mod.ports:
-        print(f"\n[ERROR] Port '{port_name}' not in module '{module_name}'.",
+        print("\n[ERROR] Port '{}' not in module '{}'.".format(
+            port_name, module_name), file=sys.stderr)
+        print("  Available ports: {}".format(', '.join(mod.ports.keys())),
               file=sys.stderr)
-        print(f"  Available ports: {', '.join(mod.ports.keys())}", file=sys.stderr)
         sys.exit(1)
 
     if port_name == new_name:
-        print("\n[INFO] Old name and new name are identical — nothing to do.")
+        print("\n[INFO] Old name and new name are identical -- nothing to do.")
         sys.exit(0)
 
     # ---- 4. Plan ----
-    print(f"\n[4/5] Computing rename propagation ...")
-    print(f"  {module_name}.{port_name}  ->  {new_name}")
+    print("\n[4/5] Computing rename propagation ...")
+    print("  {}.{}  ->  {}".format(module_name, port_name, new_name))
     plan = compute_rename_plan(modules, parent_map, module_name, port_name, new_name)
     display_plan(plan, modules)
 
@@ -695,21 +747,21 @@ Examples
 
     # ---- 5. Apply ----
     if args.dry_run:
-        print("\n[5/5] Dry-run — computing diffs ...")
+        print("\n[5/5] Dry-run -- computing diffs ...")
         by_file = defaultdict(list)
         for action in plan:
             by_file[action['file']].append(action)
         for filepath, actions in by_file.items():
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                original = f.read()
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
+                original = fh.read()
             content = original
             for action in actions:
                 start, end = _find_module_span(content, action['module'])
                 if start is None:
                     continue
                 mt = content[start:end]
-                for ct, op, np in action['inst_port_renames']:
-                    mt = _rename_inst_port(mt, ct, op, np)
+                for ct, op, np_ in action['inst_port_renames']:
+                    mt = _rename_inst_port(mt, ct, op, np_)
                 for os_, ns_ in action['signal_renames']:
                     mt = _rename_signal(mt, os_, ns_)
                 content = content[:start] + mt + content[end:]
@@ -717,14 +769,14 @@ Examples
                 display_diff(filepath, original, content)
         print("\n[DRY RUN] No files were modified.")
     else:
-        print(f"\n[5/5] Applying changes ...")
+        print("\n[5/5] Applying changes ...")
         results = apply_plan_to_files(plan, dry_run=False, backup=not args.no_backup)
         for fp in results:
-            print(f"  Modified: {os.path.relpath(fp)}")
+            print("  Modified: {}".format(os.path.relpath(fp)))
             if not args.no_backup:
-                print(f"  Backup:   {os.path.relpath(fp)}.bak")
-        print(f"\n[DONE] Renamed '{port_name}' -> '{new_name}' across "
-              f"{len(results)} file(s).")
+                print("  Backup:   {}".format(os.path.relpath(fp) + '.bak'))
+        print("\n[DONE] Renamed '{}' -> '{}' across {} file(s).".format(
+            port_name, new_name, len(results)))
 
 
 if __name__ == '__main__':
