@@ -6,10 +6,9 @@ port_hierarchy_rename.py -- Chip Design Port Hierarchy Rename Tool
 Renames a port in a Verilog module and automatically propagates the change
 upward through all hierarchy levels, as defined by a VC (filelist) file.
 
-The tool parses the VC file to discover all Verilog sources, builds the design
-hierarchy from instantiation relationships, then traces the target port upward
-through every parent module -- renaming connected signals, wire/reg declarations,
-port declarations, and instance port-connection names along the way.
+Supports width changes: e.g. renaming data_in[7:0] -> rx_data[8:0] will
+correctly update both the signal name and the width in all declarations
+(port, wire, reg) throughout the hierarchy.
 
 Requirements: Python 3.6+
 """
@@ -24,7 +23,7 @@ import argparse
 from collections import defaultdict, OrderedDict
 
 if sys.version_info < (3, 6):
-    print("ERROR: Python 3.6 or later is required (f-string support).")
+    print("ERROR: Python 3.6 or later is required.")
     print("Current version: Python {}.{}.{}".format(*sys.version_info[:3]))
     sys.exit(1)
 
@@ -50,6 +49,30 @@ VERILOG_KEYWORDS = frozenset({
     'primitive', 'endprimitive', 'table', 'endtable',
     'macromodule', 'config', 'endconfig',
 })
+
+
+# ============================================================
+#  Port Spec Parser
+# ============================================================
+
+def parse_port_spec(spec):
+    """Parse a port specification that may include a width.
+
+    Examples:
+        'data_in'       -> ('data_in', '')
+        'data_in[7:0]'  -> ('data_in', '[7:0]')
+        'rx_data[8:0]'  -> ('rx_data', '[8:0]')
+        'valid'         -> ('valid',   '')
+
+    Returns (name, width) where width includes the brackets or is ''.
+    """
+    spec = spec.strip()
+    m = re.match(r'(\w+)\s*(\[[^\]]*\])?\s*$', spec)
+    if m:
+        name = m.group(1)
+        width = m.group(2).strip() if m.group(2) else ''
+        return name, width
+    return spec, ''
 
 
 # ============================================================
@@ -175,17 +198,11 @@ def _match_paren(text, pos):
     return n
 
 
-# Regex that matches a Verilog identifier (letter or underscore, then word chars).
 _IDENT_RE = re.compile(r'[A-Za-z_]\w*')
 
 
 def _parse_instances(body):
-    """Extract module instantiations from a (comment-stripped) module body.
-
-    Scans for patterns like:
-        module_type  [#(...)]  inst_name  ( .port(signal), ... );
-    Uses _IDENT_RE to only match proper identifiers (not bare numbers).
-    """
+    """Extract module instantiations from a (comment-stripped) module body."""
     instances = []
     pos = 0
     body_len = len(body)
@@ -215,8 +232,7 @@ def _parse_instances(body):
             pos = max(after_word, cur + 1) if cur < body_len else after_word
             continue
 
-        inst_name_end = nm.end()
-        cur = _skip_ws(body, inst_name_end)
+        cur = _skip_ws(body, nm.end())
 
         if cur >= body_len or body[cur] != '(':
             pos = max(after_word, cur)
@@ -282,7 +298,6 @@ def parse_verilog_modules(file_list):
 
             mod = Module(mod_name, filepath)
 
-            # --- ports (ANSI style) ---
             ansi_pat = re.compile(
                 r'(input|output|inout)\s+'
                 r'(?:wire|reg|logic)?\s*'
@@ -296,7 +311,6 @@ def parse_verilog_modules(file_list):
                 for direction, width, name in ansi_ports:
                     mod.ports[name] = Port(name, direction, width.strip() if width else '')
             else:
-                # --- ports (non-ANSI / Verilog-1995 style) ---
                 port_names = set(re.findall(r'\w+', port_text))
                 decl_pat = re.compile(
                     r'(input|output|inout)\s+'
@@ -312,7 +326,6 @@ def parse_verilog_modules(file_list):
                         if name in port_names:
                             mod.ports[name] = Port(name, direction, width)
 
-            # --- wire / reg declarations ---
             wire_pat = re.compile(
                 r'\b(wire|reg|logic)\s+'
                 r'(?:signed\s+)?'
@@ -326,7 +339,6 @@ def parse_verilog_modules(file_list):
                     if name not in mod.ports and name not in VERILOG_KEYWORDS:
                         mod.wires[name] = {'kind': kind, 'width': width}
 
-            # --- instances ---
             mod.instances = _parse_instances(body)
 
             modules[mod_name] = mod
@@ -376,22 +388,31 @@ def print_hierarchy(modules, parent_map):
 #  Rename Propagation
 # ============================================================
 
-def compute_rename_plan(modules, parent_map, start_module, old_port, new_name):
+def compute_rename_plan(modules, parent_map, start_module,
+                        old_port_name, new_port_name, new_width):
     """
-    BFS upward from *start_module* / *old_port* and collect every rename action.
+    BFS upward from *start_module* / *old_port_name* and collect every rename.
 
-    Returns a list of action dicts (one per affected module, in bottom-up order).
+    Each action has:
+      - signal_renames: [(old_name, new_name, old_width, new_width), ...]
+        The width fields describe how declarations should be updated.
+        old_width/new_width = '' means "no width" (1-bit).
+        new_width = None means "keep original width unchanged".
+      - inst_port_renames: [(child_type, old_port, new_port), ...]
     """
     plan = OrderedDict()
+
+    old_port = modules[start_module].ports[old_port_name]
 
     plan[start_module] = {
         'module': start_module,
         'file': modules[start_module].filepath,
-        'signal_renames': [(old_port, new_name)],
+        'signal_renames': [(old_port_name, new_port_name,
+                            old_port.width, new_width)],
         'inst_port_renames': [],
     }
 
-    queue = [(start_module, old_port)]
+    queue = [(start_module, old_port_name)]
     visited = set()
 
     while queue:
@@ -419,8 +440,8 @@ def compute_rename_plan(modules, parent_map, start_module, old_port, new_name):
                 }
 
             action = plan[parent_name]
-
-            action['inst_port_renames'].append((child_mod, child_port, new_name))
+            action['inst_port_renames'].append(
+                (child_mod, child_port, new_port_name))
 
             if not re.match(r'^\w+$', connected_signal):
                 print("  [INFO] In module '{}', port .{} connects to "
@@ -429,13 +450,24 @@ def compute_rename_plan(modules, parent_map, start_module, old_port, new_name):
                           parent_name, child_port, connected_signal))
                 continue
 
-            if connected_signal != new_name:
-                pair = (connected_signal, new_name)
-                if pair not in action['signal_renames']:
+            parent_mod = modules[parent_name]
+            is_port = connected_signal in parent_mod.ports
+            is_wire = connected_signal in parent_mod.wires
+
+            if connected_signal != new_port_name:
+                if is_port:
+                    old_w = parent_mod.ports[connected_signal].width
+                elif is_wire:
+                    old_w = parent_mod.wires[connected_signal]['width']
+                else:
+                    old_w = ''
+
+                pair = (connected_signal, new_port_name, old_w, new_width)
+                existing_names = [(o, n) for o, n, _, _ in action['signal_renames']]
+                if (connected_signal, new_port_name) not in existing_names:
                     action['signal_renames'].append(pair)
 
-            parent_mod = modules[parent_name]
-            if connected_signal in parent_mod.ports:
+            if is_port:
                 queue.append((parent_name, connected_signal))
 
     return list(plan.values())
@@ -512,10 +544,97 @@ def _rename_inst_port(module_text, child_type, old_port, new_port):
     return ''.join(parts)
 
 
+def _rename_declaration(module_text, old_name, new_name, old_width, new_width):
+    """Replace a port/wire/reg declaration's name AND width.
+
+    Handles patterns like:
+        input       [7:0]  data_in     ->  input       [8:0]  rx_data
+        input              valid        ->  input              valid_out
+        wire  [7:0] data_in;           ->  wire  [8:0] rx_data;
+        reg   [7:0] data_in;           ->  reg   [8:0] rx_data;
+
+    If *new_width* is None, keeps the original width unchanged.
+    If *new_width* is '' (empty string), removes the width (1-bit signal).
+    """
+    result = module_text
+
+    # Pattern for ANSI port declarations in module header:
+    #   (input|output|inout) [wire|reg|logic] [signed] [width] name
+    # and for body declarations:
+    #   (wire|reg|logic|input|output|inout) [signed] [width] name
+    decl_kw = r'(?:input|output|inout|wire|reg|logic)'
+
+    if new_width is not None and old_width:
+        # Replace old_width with new_width in declarations containing old_name.
+        # We match a declaration keyword, optional qualifiers, then the specific
+        # old_width, then whitespace and the old signal name.
+        #
+        # This regex finds: <keyword> ... <old_width> <spaces> <old_name>
+        pat = re.compile(
+            r'(' + decl_kw + r'(?:\s+(?:wire|reg|logic))?'
+            r'(?:\s+signed)?\s+)'
+            + re.escape(old_width)
+            + r'(\s+)'
+            + re.escape(old_name)
+            + r'(?=\s*[,;)\n])'
+        )
+
+        def _repl_both(m):
+            prefix = m.group(1)
+            spacing = m.group(2)
+            w = new_width if new_width else ''
+            if w:
+                return prefix + w + spacing + new_name
+            return prefix + new_name
+
+        result = pat.sub(_repl_both, result)
+
+    elif new_width is not None and not old_width and new_width:
+        # Adding a width where there was none before.
+        # Match: <keyword> [qualifiers] <spaces> <old_name>
+        pat = re.compile(
+            r'(' + decl_kw + r'(?:\s+(?:wire|reg|logic))?'
+            r'(?:\s+signed)?\s+)'
+            + re.escape(old_name)
+            + r'(?=\s*[,;)\n])'
+        )
+
+        def _repl_add_width(m):
+            prefix = m.group(1)
+            return prefix + new_width + ' ' + new_name
+
+        result = pat.sub(_repl_add_width, result)
+
+    # For name-only rename (width unchanged or already handled above),
+    # we still need to rename the signal name in all other usages
+    # (assign statements, always blocks, etc.)
+    # This is done separately via _rename_signal.
+
+    return result
+
+
 def _rename_signal(module_text, old_sig, new_sig):
     """Replace *old_sig* as a standalone identifier (not preceded by '.') in *module_text*."""
     pattern = r'(?<!\.)(?<!\w)' + re.escape(old_sig) + r'(?!\w)'
     return re.sub(pattern, new_sig, module_text)
+
+
+def _apply_action_to_module(mod_text, action):
+    """Apply a single action's renames to a module text block.
+
+    Order of operations:
+    1. Rename instance port connections (.old_port -> .new_port)
+    2. Rename declarations (name + width in port/wire/reg lines)
+    3. Rename remaining signal references (in expressions, assigns, etc.)
+    """
+    for child_type, op, np_ in action['inst_port_renames']:
+        mod_text = _rename_inst_port(mod_text, child_type, op, np_)
+
+    for old_name, new_name, old_w, new_w in action['signal_renames']:
+        mod_text = _rename_declaration(mod_text, old_name, new_name, old_w, new_w)
+        mod_text = _rename_signal(mod_text, old_name, new_name)
+
+    return mod_text
 
 
 def apply_plan_to_files(plan, dry_run=False, backup=True):
@@ -544,13 +663,7 @@ def apply_plan_to_files(plan, dry_run=False, backup=True):
                 continue
 
             mod_text = content[start:end]
-
-            for child_type, op, np_ in action['inst_port_renames']:
-                mod_text = _rename_inst_port(mod_text, child_type, op, np_)
-
-            for old_s, new_s in action['signal_renames']:
-                mod_text = _rename_signal(mod_text, old_s, new_s)
-
+            mod_text = _apply_action_to_module(mod_text, action)
             content = content[:start] + mod_text + content[end:]
 
         if content != original:
@@ -564,9 +677,38 @@ def apply_plan_to_files(plan, dry_run=False, backup=True):
     return results
 
 
+def _compute_dry_run_content(plan):
+    """Compute modified file contents without writing. Returns {filepath: (original, modified)}."""
+    by_file = defaultdict(list)
+    for action in plan:
+        by_file[action['file']].append(action)
+
+    results = OrderedDict()
+    for filepath, actions in by_file.items():
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
+            original = fh.read()
+        content = original
+        for action in actions:
+            start, end = _find_module_span(content, action['module'])
+            if start is None:
+                continue
+            mt = content[start:end]
+            mt = _apply_action_to_module(mt, action)
+            content = content[:start] + mt + content[end:]
+        if content != original:
+            results[filepath] = (original, content)
+
+    return results
+
+
 # ============================================================
 #  Display Helpers
 # ============================================================
+
+def _fmt_width(w):
+    """Format a width string for display, or '(1-bit)' if empty."""
+    return w if w else '(1-bit)'
+
 
 def display_plan(plan, modules):
     """Print the rename plan in human-readable format."""
@@ -581,19 +723,27 @@ def display_plan(plan, modules):
         print("  [{}] Module: {}".format(idx, action['module']))
         print("      File:   {}".format(os.path.relpath(action['file'])))
 
-        for old, new in action['signal_renames']:
-            p = mod.ports.get(old)
-            w = mod.wires.get(old)
+        for old_name, new_name, old_w, new_w in action['signal_renames']:
+            p = mod.ports.get(old_name)
+            w = mod.wires.get(old_name)
             if p:
-                width_str = " " + p.width if p.width else ""
-                print("      Port rename:   {}{} {}  ->  {}".format(
-                    p.direction, width_str, old, new))
+                if new_w is not None and new_w != old_w:
+                    print("      Port rename:   {} {} {}  ->  {} {}".format(
+                        p.direction, _fmt_width(old_w), old_name,
+                        _fmt_width(new_w), new_name))
+                else:
+                    print("      Port rename:   {} {} {}  ->  {}".format(
+                        p.direction, _fmt_width(p.width), old_name, new_name))
             if w:
-                width_str = " " + w['width'] if w['width'] else ""
-                print("      Wire rename:   {}{} {}  ->  {}".format(
-                    w['kind'], width_str, old, new))
+                if new_w is not None and new_w != old_w:
+                    print("      Wire rename:   {} {} {}  ->  {} {}".format(
+                        w['kind'], _fmt_width(old_w), old_name,
+                        _fmt_width(new_w), new_name))
+                else:
+                    print("      Wire rename:   {} {} {}  ->  {}".format(
+                        w['kind'], _fmt_width(w['width']), old_name, new_name))
             if not p and not w:
-                print("      Signal rename: {}  ->  {}".format(old, new))
+                print("      Signal rename: {}  ->  {}".format(old_name, new_name))
 
         for child_type, old_port, new_port in action['inst_port_renames']:
             print("      Inst port:     {}  .{}()  ->  .{}()".format(
@@ -626,26 +776,27 @@ def display_diff(filepath, original, modified):
 #  Main
 # ============================================================
 
-def _parse_port_spec(spec):
-    """Parse 'data_in[7:0]' -> ('data_in', '[7:0]')."""
-    m = re.match(r'(\w+)\s*(\[[\d: ]+\])?\s*$', spec.strip())
-    if m:
-        return m.group(1), (m.group(2) or '').strip()
-    return spec.strip(), ''
-
-
 def main():
     ap = argparse.ArgumentParser(
         description=(
             'Chip-design port hierarchy rename tool.\n'
-            'Renames a port and propagates the change through all hierarchy levels.'
+            'Renames a port (with optional width change) and propagates\n'
+            'the change through all hierarchy levels.'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             'Examples\n'
             '--------\n'
+            '  # Rename only (no width change):\n'
             '  %(prog)s -m leaf_cell -p data_in -n rx_data -vc project.vc\n'
-            '  %(prog)s -m leaf_cell -p "data_in[7:0]" -n rx_data -vc project.vc --dry-run\n'
+            '\n'
+            '  # Rename with width change:\n'
+            '  %(prog)s -m leaf_cell -p "data_in[7:0]" -n "rx_data[8:0]" -vc project.vc\n'
+            '\n'
+            '  # Preview without modifying:\n'
+            '  %(prog)s -m leaf_cell -p "data_in[7:0]" -n "rx_data[8:0]" -vc project.vc --dry-run\n'
+            '\n'
+            '  # Skip confirmation:\n'
             '  %(prog)s -m leaf_cell -p data_in -n rx_data -vc project.vc --no-backup -y\n'
         ),
     )
@@ -653,9 +804,9 @@ def main():
     ap.add_argument('-m', '--module',
                     help='Module name that owns the port to rename')
     ap.add_argument('-p', '--port',
-                    help='Current port name (may include width, e.g. data_in[7:0])')
+                    help='Current port name, e.g. data_in or "data_in[7:0]"')
     ap.add_argument('-n', '--new-name',
-                    help='New port / signal name')
+                    help='New port name, e.g. rx_data or "rx_data[8:0]"')
     ap.add_argument('-vc', '--vc-file',
                     help='Path to VC / filelist file')
     ap.add_argument('--dry-run', action='store_true',
@@ -669,7 +820,6 @@ def main():
 
     args = ap.parse_args()
 
-    # --- VC file is always needed ---
     if not args.vc_file:
         args.vc_file = input('VC file path: ').strip()
 
@@ -698,19 +848,29 @@ def main():
     if args.show_hierarchy:
         sys.exit(0)
 
-    # ---- collect remaining args (interactive fallback) ----
+    # ---- collect remaining args ----
     if not args.module:
         args.module = input('Module name: ').strip()
     if not args.port:
         args.port = input('Port name (e.g. data_in or data_in[7:0]): ').strip()
     if not args.new_name:
-        args.new_name = input('New port name: ').strip()
+        args.new_name = input('New port name (e.g. rx_data or rx_data[8:0]): ').strip()
 
-    port_name, _ = _parse_port_spec(args.port)
-    new_name = args.new_name.strip()
+    old_port_name, old_port_width = parse_port_spec(args.port)
+    new_port_name, new_port_width_raw = parse_port_spec(args.new_name)
+
     module_name = args.module.strip()
     if module_name.endswith('.v'):
         module_name = module_name[:-2]
+
+    # Determine new_width semantics:
+    #   - User gave "rx_data[8:0]" => new_width = "[8:0]" (change width)
+    #   - User gave "rx_data" with old "[7:0]" => new_width = None (keep original)
+    #   - User gave "rx_data" with old "" => new_width = None (keep original, both 1-bit)
+    if new_port_width_raw:
+        new_width = new_port_width_raw
+    else:
+        new_width = None
 
     # ---- validate ----
     if module_name not in modules:
@@ -719,21 +879,36 @@ def main():
         sys.exit(1)
 
     mod = modules[module_name]
-    if port_name not in mod.ports:
+    if old_port_name not in mod.ports:
         print("\n[ERROR] Port '{}' not in module '{}'.".format(
-            port_name, module_name), file=sys.stderr)
+            old_port_name, module_name), file=sys.stderr)
         print("  Available ports: {}".format(', '.join(mod.ports.keys())),
               file=sys.stderr)
         sys.exit(1)
 
-    if port_name == new_name:
+    if old_port_name == new_port_name and new_width is None:
         print("\n[INFO] Old name and new name are identical -- nothing to do.")
         sys.exit(0)
 
+    actual_old_width = mod.ports[old_port_name].width
+    if old_port_width and old_port_width != actual_old_width:
+        print("\n[WARN] Specified old width {} does not match actual "
+              "declaration width {} -- using actual.".format(
+                  old_port_width, actual_old_width or '(1-bit)'))
+
     # ---- 4. Plan ----
     print("\n[4/5] Computing rename propagation ...")
-    print("  {}.{}  ->  {}".format(module_name, port_name, new_name))
-    plan = compute_rename_plan(modules, parent_map, module_name, port_name, new_name)
+    if new_width is not None:
+        print("  {}.{} {}  ->  {} {}".format(
+            module_name, old_port_name,
+            _fmt_width(actual_old_width),
+            new_port_name, _fmt_width(new_width)))
+    else:
+        print("  {}.{}  ->  {}".format(module_name, old_port_name, new_port_name))
+
+    plan = compute_rename_plan(
+        modules, parent_map, module_name,
+        old_port_name, new_port_name, new_width)
     display_plan(plan, modules)
 
     if not args.dry_run and not args.yes:
@@ -748,25 +923,9 @@ def main():
     # ---- 5. Apply ----
     if args.dry_run:
         print("\n[5/5] Dry-run -- computing diffs ...")
-        by_file = defaultdict(list)
-        for action in plan:
-            by_file[action['file']].append(action)
-        for filepath, actions in by_file.items():
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
-                original = fh.read()
-            content = original
-            for action in actions:
-                start, end = _find_module_span(content, action['module'])
-                if start is None:
-                    continue
-                mt = content[start:end]
-                for ct, op, np_ in action['inst_port_renames']:
-                    mt = _rename_inst_port(mt, ct, op, np_)
-                for os_, ns_ in action['signal_renames']:
-                    mt = _rename_signal(mt, os_, ns_)
-                content = content[:start] + mt + content[end:]
-            if content != original:
-                display_diff(filepath, original, content)
+        diffs = _compute_dry_run_content(plan)
+        for filepath, (original, modified) in diffs.items():
+            display_diff(filepath, original, modified)
         print("\n[DRY RUN] No files were modified.")
     else:
         print("\n[5/5] Applying changes ...")
@@ -775,8 +934,12 @@ def main():
             print("  Modified: {}".format(os.path.relpath(fp)))
             if not args.no_backup:
                 print("  Backup:   {}".format(os.path.relpath(fp) + '.bak'))
-        print("\n[DONE] Renamed '{}' -> '{}' across {} file(s).".format(
-            port_name, new_name, len(results)))
+        change_desc = "'{}' -> '{}'".format(old_port_name, new_port_name)
+        if new_width is not None:
+            change_desc += " (width: {} -> {})".format(
+                _fmt_width(actual_old_width), _fmt_width(new_width))
+        print("\n[DONE] Renamed {} across {} file(s).".format(
+            change_desc, len(results)))
 
 
 if __name__ == '__main__':
