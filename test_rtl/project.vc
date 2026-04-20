@@ -1,0 +1,16 @@
+// ============================================================
+//  project.vc — Filelist for test design
+//  Defines the compile order (bottom-up)
+// ============================================================
+
+// Leaf level
+leaf_cell.v
+
+// Sub-unit level
+sub_unit.v
+
+// Mid-level block
+mid_block.v
+
+// Top level
+top.v
